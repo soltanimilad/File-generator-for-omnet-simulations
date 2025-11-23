@@ -385,7 +385,6 @@ class SumoWorker(QThread):
         # --- Step 7: Configuration Files (Unchanged) ---
         self.log("--- Step 7: Writing Configuration Files ---")
         launchd = self.generate_launchd(filename)
-        self.generate_omnetpp(filename)
         sumocfg = self.generate_sumocfg(filename, route_file)
 
         # --- Step 8: Cleanup (Unchanged) ---
@@ -407,21 +406,6 @@ class SumoWorker(QThread):
         with open(name, 'w') as f: f.write(content)
         self.log(f"Created {name}")
         return name
-
-    def generate_omnetpp(self, filename):
-        content = f"""[General]
-network = {filename}
-sim-time-limit = {self.end_time}s
-*.manager.launchConfig = xmldoc("{filename}.launchd.xml")
-*.manager.moduleType = "org.car2x.veins.nodes.Car"
-*.rsu[*].applType = "TraCIDemoRSU11p"
-*.node[*].applType = "TraCIDemo11p"
-*.node[*].veinsmobility.x = 0
-*.node[*].veinsmobility.y = 0
-*.node[*].veinsmobility.z = 1.895
-"""
-        with open("omnetpp.ini", 'w') as f: f.write(content)
-        self.log("Created omnetpp.ini")
 
     def generate_sumocfg(self, filename, route_file):
         content = f"""<configuration>
@@ -465,7 +449,7 @@ class SumoApp(QMainWindow):
         
         self.filename_edit = QLineEdit("VeinsScenario")
         self.time_spin = QSpinBox(); self.time_spin.setRange(100, 100000); self.time_spin.setValue(3600)
-        self.trips_spin = QSpinBox(); self.trips_spin.setRange(1, 100000); self.trips_spin.setValue(1000)
+        self.trips_spin = QSpinBox(); self.trips_spin.setRange(1, 100000); self.trips_spin.setValue(1000000)
         
         controls_layout.addWidget(QLabel("Filename:"))
         controls_layout.addWidget(self.filename_edit)
