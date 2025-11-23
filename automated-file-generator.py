@@ -2,16 +2,73 @@ import sys
 import os
 import subprocess
 import time
-import glob
-from typing import Tuple, List
+import glob 
+import xml.etree.ElementTree as ET
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+from collections import Counter
+from typing import Tuple, List, Optional
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                              QWidget, QPushButton, QLabel, QLineEdit, QSpinBox, 
-                             QTabWidget, QMessageBox, QProgressBar, QTextEdit, QFileDialog, QSplitter)
+                             QTabWidget, QMessageBox, QTextEdit, QFileDialog, QSplitter)
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
 
-# --- 1. LEAFLET MAP HTML ---
+# --- CONSTANTS ---
+# Minimum required size for a valid OSM file (in bytes). 
+# Set to 10 KB (10240 bytes) as a sanity check.
+MIN_OSM_FILE_SIZE = 1024 * 10 
+
+# --- New Plot Widget Class ---
+class PlotViewer(QWidget):
+    """A QWidget that contains a Matplotlib figure."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.layout = QVBoxLayout(self)
+        self.canvas = None
+        
+    def set_plot(self, figure: Figure, filename: str):
+        """Removes old canvas and adds a new one based on the given Figure."""
+        if self.canvas:
+            self.layout.removeWidget(self.canvas)
+            self.canvas.deleteLater()
+            
+        self.canvas = FigureCanvas(figure)
+        self.layout.addWidget(self.canvas)
+        self.setWindowTitle(f"Edge Usage: {filename}")
+        self.update()
+
+# --- Refactored Plotting Function (Returns Figure instead of saving) ---
+def create_most_used_edges_plot(top_edges: List[Tuple[str, int]], filename: str) -> Optional[Figure]:
+    if not top_edges:
+        return None
+
+    edges = [item[0] for item in top_edges]
+    counts = [item[1] for item in top_edges]
+    
+    fig = Figure(figsize=(10, 6))
+    ax = fig.add_subplot(111)
+    
+    y_pos = range(len(counts))
+    ax.barh(y_pos, counts, align='center', color='#0078D7')
+    
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(edges)
+    
+    for i, count in enumerate(counts):
+        ax.text(count, i, f' {count:,}', va='center')
+
+    ax.invert_yaxis()
+    ax.set_xlabel('Number of Vehicles Traversed')
+    ax.set_title(f'Top {len(top_edges)} Most Used Edges in Route File')
+    
+    fig.tight_layout()
+    return fig
+
+
+# --- 1. LEAFLET MAP HTML (Unchanged) ---
 MAP_HTML = """
 <!DOCTYPE html>
 <html>
@@ -77,11 +134,10 @@ MAP_HTML = """
 </body>
 </html>
 """
-
-# --- 2. WORKER THREAD (THE LOGIC) ---
+# --- 2. WORKER THREAD ---
 class SumoWorker(QThread):
     log_signal = pyqtSignal(str)    
-    finished_signal = pyqtSignal(bool) 
+    finished_signal = pyqtSignal(bool, object) 
     
     def __init__(self, config):
         super().__init__()
@@ -94,27 +150,27 @@ class SumoWorker(QThread):
     def run(self):
         self.log_signal.emit("--- Starting SUMO Generation Process ---")
         
-        # 1. Find SUMO
         if not self.find_sumo_and_add_path():
             self.log_signal.emit("❌ Error: SUMO_HOME not found.")
-            self.finished_signal.emit(False)
+            self.finished_signal.emit(False, None)
             return
 
-        # 2. Process Data
+        plot_figure = None
         try:
-            success, launch, cfg = self.create_files()
+            success, launch, cfg, plot_figure = self.create_files() 
+            
             if success:
                 self.log_signal.emit("\n✨ PROCESS COMPLETE ✨")
                 self.log_signal.emit(f"Veins Launch File: {launch}")
                 self.log_signal.emit(f"SUMO Config File: {cfg}")
-                self.finished_signal.emit(True)
+                self.finished_signal.emit(True, plot_figure) 
             else:
-                self.finished_signal.emit(False)
+                self.finished_signal.emit(False, None)
         except Exception as e:
             import traceback
             self.log_signal.emit(f"❌ Unexpected Error: {str(e)}")
             self.log_signal.emit(traceback.format_exc())
-            self.finished_signal.emit(False)
+            self.finished_signal.emit(False, None)
 
     def log(self, msg):
         self.log_signal.emit(msg)
@@ -128,6 +184,7 @@ class SumoWorker(QThread):
                 os.environ['SUMO_HOME'] = fallback
                 self.sumo_home = fallback
             else:
+                self.log("❌ Error: SUMO_HOME environment variable is not set and fallback path not found.")
                 return False
 
         tools = os.path.join(self.sumo_home, 'tools')
@@ -164,8 +221,50 @@ class SumoWorker(QThread):
         except Exception as e:
             self.log(f"❌ Error executing {description}: {e}")
             return False
+            
+    def most_used_route_finder(self, route_file: str, top_n: int = 10) -> List[Tuple[str, int]]:
+        if not os.path.exists(route_file):
+            self.log(f"⚠️ Cannot analyze routes: File not found at {route_file}")
+            return []
 
-    def create_files(self):
+        self.log(f"\n🔬 Starting analysis of most used edges in '{route_file}'...")
+        edge_counts = Counter()
+        total_edges = 0
+
+        try:
+            tree = ET.parse(route_file)
+            root = tree.getroot()
+            
+            for vehicle in root.iter('vehicle'):
+                route_element = vehicle.find('route')
+                
+                if route_element is not None:
+                    edges_list_str = route_element.get("edges")
+                    
+                    if edges_list_str:
+                        edge_ids = edges_list_str.split()
+                        edge_counts.update(edge_ids)
+                        total_edges += len(edge_ids)
+
+        except Exception as e:
+            self.log(f"❌ Error during route analysis: {e}")
+            return []
+
+        most_common_edges = edge_counts.most_common(top_n)
+
+        # Log the results to the GUI
+        self.log("\n--- Edge Usage Report ---")
+        self.log(f"Total Unique Edges Used: **{len(edge_counts):,}**")
+        self.log(f"Total Edges Traversed: **{total_edges:,}**")
+        self.log(f"Top {top_n} Most Used Edges:")
+        
+        for edge_id, count in most_common_edges:
+            percentage = (count / total_edges) * 100 if total_edges > 0 else 0
+            self.log(f"* **{edge_id}**: {count:,} times ({percentage:.2f}%)")
+            
+        return most_common_edges
+        
+    def create_files(self) -> Tuple[bool, str, str, Optional[Figure]]:
         filename = self.filename
         osm_file = f"{filename}.osm"
         net_file = f"{filename}.net.xml"
@@ -173,24 +272,43 @@ class SumoWorker(QThread):
         trip_file = f"{filename}.trip.xml"
         route_file = f"{filename}.rou.xml"
 
-        # --- Step 1: Check for Existing OSM OR Download ---
+        # --- Step 1: Map Data Setup (Updated Check) ---
         self.log("--- Step 1: Map Data Setup ---")
         
-        if os.path.exists(osm_file):
-            self.log(f"✅ Found existing OSM file: '{osm_file}'")
-            self.log("ℹ️ Skipping download step and using existing file.")
-        else:
-            self.log(f"ℹ️ No existing file '{osm_file}' found. Starting download...")
+        osm_file_exists = os.path.exists(osm_file)
+        should_download = True # Assume download is needed unless checks pass
+
+        if osm_file_exists:
+            file_size = os.path.getsize(osm_file)
+            
+            if file_size > MIN_OSM_FILE_SIZE:
+                self.log(f"✅ Found existing OSM file: '{osm_file}' (Size: {file_size // 1024} KB)")
+                self.log("ℹ️ Skipping download step and using existing file.")
+                should_download = False # File is valid, skip download
+            else:
+                self.log(f"⚠️ Found file '{osm_file}', but size ({file_size} bytes) is too small (<{MIN_OSM_FILE_SIZE} bytes).")
+                self.log("ℹ️ Re-downloading map data to ensure completeness.")
+                # should_download remains True
+
+        if should_download:
+            self.log(f"ℹ️ Starting download...")
+
+            # If bounds are dummy (i.e., we are relying on an existing file that failed size check), we must have real bounds to download!
+            # If bbox is {0,0,0,0}, the user must have pressed generate without selecting a map area. 
+            # In this case, we rely on the Handle_Bounds function to stop the process before this worker starts. 
+            # If the worker starts, we assume the bounds are either real or the user intended to use an existing, valid file (which we already ruled out if we are here).
+            # Therefore, we use the bounds provided, which should be valid if download is needed.
+            
             download_script = os.path.join(self.sumo_home, 'tools', 'osmGet.py')
             
+            # The bbox must be valid here because the SumoApp checked this condition.
             bbox_str = f"{self.bbox['west']},{self.bbox['south']},{self.bbox['east']},{self.bbox['north']}"
             
             cmd = [sys.executable, download_script, f"--bbox={bbox_str}", "-p", filename, "-d", "."]
             
-            if not self.run_command(cmd, "OSM Download"):
-                return False, "", ""
+            if not self.run_command(cmd, "OSM Download"): return False, "", "", None
 
-            # Find generated file (usually prefix_bbox.osm.xml) and rename it
+            # Find generated file and rename it
             generated_files = glob.glob(f"{filename}*_bbox.osm.xml")
             
             if generated_files:
@@ -203,9 +321,9 @@ class SumoWorker(QThread):
                 self.log(f"✅ Renamed '{filename}.osm.xml' to '{osm_file}'")
             else:
                 self.log(f"❌ Error: Download finished but expected output file not found.")
-                return False, "", ""
+                return False, "", "", None
 
-        # --- Step 2: Netconvert ---
+        # --- Step 2: Netconvert (Unchanged) ---
         self.log("--- Step 2: Converting to Network (Netconvert) ---")
         net_cmd = [
             "netconvert", 
@@ -216,9 +334,9 @@ class SumoWorker(QThread):
             "--tls.discard-simple", 
             "--tls.join"
         ]
-        if not self.run_command(net_cmd, "Netconvert"): return False, "", ""
+        if not self.run_command(net_cmd, "Netconvert"): return False, "", "", None
 
-        # --- Step 3: Polyconvert ---
+        # --- Step 3: Polyconvert (Unchanged) ---
         self.log("--- Step 3: Generating Polygons (Polyconvert) ---")
         typemap = os.path.join(self.sumo_home, 'data', 'typemap', 'osmPolyconvert.typ.xml')
         if os.path.exists(typemap):
@@ -226,7 +344,7 @@ class SumoWorker(QThread):
         else:
             self.log("⚠️ Typemap not found, skipping Polyconvert.")
 
-        # --- Step 4: Random Trips ---
+        # --- Step 4: Random Trips (Unchanged) ---
         self.log("--- Step 4: Generating Random Trips ---")
         random_trips_script = os.path.join(self.sumo_home, 'tools', 'randomTrips.py')
         trip_period = self.end_time / self.num_trips
@@ -239,9 +357,9 @@ class SumoWorker(QThread):
             "-p", str(trip_period),
             "--validate"
         ]
-        if not self.run_command(trips_cmd, "Random Trips"): return False, "", ""
+        if not self.run_command(trips_cmd, "Random Trips"): return False, "", "", None
 
-        # --- Step 5: DUAROUTER ---
+        # --- Step 5: DUAROUTER (Unchanged) ---
         self.log("--- Step 5: Calculating Routes (DUAROUTER) ---")
         dua_cmd = [
             "duarouter",
@@ -249,20 +367,34 @@ class SumoWorker(QThread):
             "-t", trip_file,
             "-o", route_file
         ]
-        if not self.run_command(dua_cmd, "DUAROUTER"): return False, "", ""
+        if not self.run_command(dua_cmd, "DUAROUTER"): return False, "", "", None
 
-        # --- Step 6: Configuration Files ---
-        self.log("--- Step 6: Writing Configuration Files ---")
+        # --- Step 6: Route Analysis and Plotting (Unchanged) ---
+        self.log("--- Step 6: Analyzing Route Usage and Plotting ---")
+        
+        top_edges_list = self.most_used_route_finder(route_file, top_n=10)
+        plot_figure = None
+        
+        if top_edges_list:
+            plot_figure = create_most_used_edges_plot(top_edges_list, filename)
+            self.log("📊 Graphical Report Figure created successfully.")
+        else:
+            self.log("⚠️ Plotting skipped: No edges found in the route file.")
+
+
+        # --- Step 7: Configuration Files (Unchanged) ---
+        self.log("--- Step 7: Writing Configuration Files ---")
         launchd = self.generate_launchd(filename)
         self.generate_omnetpp(filename)
         sumocfg = self.generate_sumocfg(filename, route_file)
 
-        # --- Step 7: Cleanup ---
-        self.log("--- Step 7: Cleaning up ---")
+        # --- Step 8: Cleanup (Unchanged) ---
+        self.log("--- Step 8: Cleaning up ---")
         self.cleanup(filename)
 
-        return True, launchd, sumocfg
+        return True, launchd, sumocfg, plot_figure
 
+    # --- Configuration Generating Functions (Unchanged) ---
     def generate_launchd(self, filename):
         content = f"""<?xml version="1.0"?>
 <launch>
@@ -317,22 +449,20 @@ sim-time-limit = {self.end_time}s
                     self.log(f"Removed temp file: {f}")
                 except: pass
 
-# --- 3. MAIN APPLICATION ---
+# --- 3. MAIN APPLICATION (Modified Handle Bounds) ---
 class SumoApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Veins/SUMO Scenario Generator")
         self.resize(1200, 850)
         
-        # Setup UI
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
 
-        # Top Controls
+        # Top Controls (Unchanged)
         controls_layout = QHBoxLayout()
         
-        # Inputs
         self.filename_edit = QLineEdit("VeinsScenario")
         self.time_spin = QSpinBox(); self.time_spin.setRange(100, 100000); self.time_spin.setValue(3600)
         self.trips_spin = QSpinBox(); self.trips_spin.setRange(1, 100000); self.trips_spin.setValue(1000)
@@ -354,16 +484,20 @@ class SumoApp(QMainWindow):
         # Tabs
         self.tabs = QTabWidget()
         
-        # Tab 1: Map
+        # Tab 1: Map (Unchanged)
         self.map_view = QWebEngineView()
         self.map_view.setHtml(MAP_HTML)
         self.tabs.addTab(self.map_view, "1. Select Area")
         
-        # Tab 2: Logs
+        # Tab 2: Logs (Unchanged)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: monospace;")
         self.tabs.addTab(self.log_view, "2. Process Log")
+        
+        # Tab 3: Plot (NEW)
+        self.plot_viewer = PlotViewer()
+        self.tabs.addTab(self.plot_viewer, "3. Route Analysis Plot")
         
         layout.addWidget(self.tabs)
 
@@ -372,46 +506,68 @@ class SumoApp(QMainWindow):
         self.map_view.page().runJavaScript("getSelectionBounds()", self.handle_bounds)
 
     def handle_bounds(self, bounds):
-        if not bounds:
-            # If manual filename provided, try to proceed even without bounds
-            # (Useful if file already exists)
-            pass 
-            # However, current worker expects bounds. 
-            # We will just let the user know or pass default/dummy bounds if file exists.
-            # For safety, we enforce bounds selection or assume default if not provided (user must draw box).
-            QMessageBox.warning(self, "Error", "Please draw a rectangle on the map first.")
-            return
+        """
+        Handles the bounds data and initiates the worker thread.
+        Checks for file existence/size if bounds are missing.
+        """
+        filename = self.filename_edit.text().strip()
+        osm_file = f"{filename}.osm"
+        is_valid_file = False
+        
+        # Check if a valid file exists
+        if os.path.exists(osm_file):
+            if os.path.getsize(osm_file) > MIN_OSM_FILE_SIZE:
+                is_valid_file = True
 
-        # 2. Prepare Config
+        # --- CORE NEW LOGIC ---
+        if not bounds:
+            if is_valid_file:
+                # Case 1: No selection, but a valid file exists -> Proceed using dummy bounds
+                QMessageBox.information(self, "Using Existing File", f"No area selected. Proceeding with analysis and generation using existing file: {osm_file}")
+                # Set dummy bounds, the worker will check 'should_download' internally
+                bounds = {'west': 0, 'south': 0, 'east': 0, 'north': 0} 
+            else:
+                # Case 2: No selection and no valid file exists -> Stop and prompt user
+                QMessageBox.warning(self, "Action Required", "Please draw a rectangle on the map to define the simulation area, or ensure a valid OSM file exists.")
+                self.tabs.setCurrentIndex(0) # Return to the map tab
+                return
+        # --- END CORE NEW LOGIC ---
+        
+        # If bounds exist, or if we are in Case 1, we proceed here.
         config = {
-            'filename': self.filename_edit.text().strip(),
+            'filename': filename,
             'bbox': bounds,
             'end_time': self.time_spin.value(),
             'num_trips': self.trips_spin.value()
         }
 
-        # 3. Switch to Log Tab
+        # Switch to Log Tab
         self.tabs.setCurrentIndex(1)
         self.log_view.clear()
         self.btn_generate.setEnabled(False)
 
-        # 4. Start Worker
+        # Start Worker
         self.worker = SumoWorker(config)
         self.worker.log_signal.connect(self.update_log)
-        self.worker.finished_signal.connect(self.process_finished)
+        self.worker.finished_signal.connect(self.process_finished) 
         self.worker.start()
 
     def update_log(self, text):
         self.log_view.append(text)
-        # Scroll to bottom
         cursor = self.log_view.textCursor()
         cursor.movePosition(cursor.End)
         self.log_view.setTextCursor(cursor)
-
-    def process_finished(self, success):
+        
+    def process_finished(self, success: bool, plot_figure: Optional[Figure]): 
         self.btn_generate.setEnabled(True)
+        filename = self.filename_edit.text().strip()
+        
         if success:
-            QMessageBox.information(self, "Success", "All files generated successfully!\nCheck the application folder.")
+            QMessageBox.information(self, "Success", "All files generated successfully! The route analysis plot is available in the 'Route Analysis Plot' tab.")
+            
+            if plot_figure:
+                self.plot_viewer.set_plot(plot_figure, filename)
+                self.tabs.setCurrentIndex(2)
         else:
             QMessageBox.critical(self, "Failed", "Process failed. Check the logs for details.")
 
