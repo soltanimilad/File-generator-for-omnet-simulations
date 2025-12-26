@@ -1,6 +1,8 @@
 import sys
 import os
 import subprocess
+import shutil
+import platform
 import time
 import glob 
 import xml.etree.ElementTree as ET
@@ -16,12 +18,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtCore import QThread, pyqtSignal, Qt
 
-# --- CONSTANTS ---
-# Minimum required size for a valid OSM file (in bytes). 
-# Set to 10 KB (10240 bytes) as a sanity check.
 MIN_OSM_FILE_SIZE = 1024 * 10 
 
-# --- New Plot Widget Class ---
 class PlotViewer(QWidget):
     """A QWidget that contains a Matplotlib figure."""
     def __init__(self, parent=None):
@@ -39,8 +37,6 @@ class PlotViewer(QWidget):
         self.layout.addWidget(self.canvas)
         self.setWindowTitle(f"Edge Usage: {filename}")
         self.update()
-
-# --- Refactored Plotting Function (Returns Figure instead of saving) ---
 def create_most_used_edges_plot(top_edges: List[Tuple[str, int]], filename: str) -> Optional[Figure]:
     if not top_edges:
         return None
@@ -67,8 +63,6 @@ def create_most_used_edges_plot(top_edges: List[Tuple[str, int]], filename: str)
     fig.tight_layout()
     return fig
 
-
-# --- 1. LEAFLET MAP HTML (Unchanged) ---
 MAP_HTML = """
 <!DOCTYPE html>
 <html>
@@ -134,7 +128,6 @@ MAP_HTML = """
 </body>
 </html>
 """
-# --- 2. WORKER THREAD ---
 class SumoWorker(QThread):
     log_signal = pyqtSignal(str)    
     finished_signal = pyqtSignal(bool, object) 
@@ -180,23 +173,35 @@ class SumoWorker(QThread):
         self.log_signal.emit(msg)
 
     def find_sumo_and_add_path(self) -> bool:
-        if 'SUMO_HOME' in os.environ:
-            self.sumo_home = os.environ['SUMO_HOME']
-        else:
-            fallback = '/home/soltani/Downloads/Compressed/sumo-1.22.0'
-            if os.path.exists(fallback):
-                os.environ['SUMO_HOME'] = fallback
-                self.sumo_home = fallback
-            else:
-                self.log("❌ Error: SUMO_HOME environment variable is not set and fallback path not found.")
-                return False
+        sumo_home = os.environ.get('SUMO_HOME')
+        if not sumo_home:
+            sumo_bin = shutil.which("sumo")
+            if sumo_bin:
+                sumo_home = os.path.dirname(os.path.dirname(sumo_bin))
+        if not sumo_home:
+            defaults = {
+                "Windows": [r"C:\Program Files (x86)\Eclipse\Sumo", r"C:\Sumo"],
+                "Linux": ["/usr/share/sumo", "/usr/local/share/sumo"],
+                "Darwin": ["/opt/homebrew/opt/sumo/share/sumo", "/usr/local/opt/sumo/share/sumo"]
+            }
+            system = platform.system()
+            for path in defaults.get(system, []):
+                if os.path.exists(path):
+                    sumo_home = path
+                    break
+        if sumo_home and os.path.exists(os.path.join(sumo_home, 'tools')):
+            self.sumo_home = sumo_home
+            os.environ['SUMO_HOME'] = sumo_home
 
-        tools = os.path.join(self.sumo_home, 'tools')
-        if tools not in sys.path:
-            sys.path.append(tools)
-        
-        self.log(f"✅ Found SUMO_HOME: {self.sumo_home}")
-        return True
+            tools = os.path.join(self.sumo_home, 'tools')
+            if tools not in sys.path:
+                sys.path.append(tools)
+
+            self.log(f"✅ Found SUMO_HOME: {self.sumo_home}")
+            return True
+
+        self.log("❌ Error: Could not automatically locate SUMO installation.")
+        return False
 
     def run_command(self, command: List[str], description: str) -> bool:
         self.log(f"\n▶️ Running: {description}...")
@@ -419,12 +424,10 @@ sim-time-limit = {end_time}s
         poly_file = f"{filename}.poly.xml"
         trip_file = f"{filename}.trip.xml"
         route_file = f"{filename}.rou.xml"
-
-        # --- Step 1: Map Data Setup (Updated Check) ---
         self.log("--- Step 1: Map Data Setup ---")
         
         osm_file_exists = os.path.exists(osm_file)
-        should_download = True # Assume download is needed unless checks pass
+        should_download = True 
 
         if osm_file_exists:
             file_size = os.path.getsize(osm_file)
@@ -440,23 +443,13 @@ sim-time-limit = {end_time}s
 
         if should_download:
             self.log(f"ℹ️ Starting download...")
-
-            # If bounds are dummy (i.e., we are relying on an existing file that failed size check), we must have real bounds to download!
-            # If bbox is {0,0,0,0}, the user must have pressed generate without selecting a map area. 
-            # In this case, we rely on the Handle_Bounds function to stop the process before this worker starts. 
-            # If the worker starts, we assume the bounds are either real or the user intended to use an existing, valid file (which we already ruled out if we are here).
-            # Therefore, we use the bounds provided, which should be valid if download is needed.
             
             download_script = os.path.join(self.sumo_home, 'tools', 'osmGet.py')
-            
-            # The bbox must be valid here because the SumoApp checked this condition.
             bbox_str = f"{self.bbox['west']},{self.bbox['south']},{self.bbox['east']},{self.bbox['north']}"
             
             cmd = [sys.executable, download_script, f"--bbox={bbox_str}", "-p", filename, "-d", "."]
             
             if not self.run_command(cmd, "OSM Download"): return False, "", "", None
-
-            # Find generated file and rename it
             generated_files = glob.glob(f"{filename}*_bbox.osm.xml")
             
             if generated_files:
@@ -470,8 +463,6 @@ sim-time-limit = {end_time}s
             else:
                 self.log(f"❌ Error: Download finished but expected output file not found.")
                 return False, "", "", None
-
-        # --- Step 2: Netconvert (Unchanged) ---
         self.log("--- Step 2: Converting to Network (Netconvert) ---")
         net_cmd = [
     "netconvert", 
@@ -480,22 +471,17 @@ sim-time-limit = {end_time}s
     "--junctions.join",              # Joins nearby nodes into single intersections
     "--no-internal-links", "false",  # Crucial: enables physical turns for blocking
     "--keep-edges.components", "1",  # Deletes disconnected "island" roads
-    "--tls.discard-simple",          # Removes unnecessary traffic lights
     "--tls.join",                    # Groups traffic lights at large junctions
     "--geometry.remove",             # Simplifies road shapes for better performance
     "--roundabouts.guess"            # Identifies roundabouts for better routing
 ]
         if not self.run_command(net_cmd, "Netconvert"): return False, "", "", None
-
-        # --- Step 3: Polyconvert (Unchanged) ---
         self.log("--- Step 3: Generating Polygons (Polyconvert) ---")
         typemap = os.path.join(self.sumo_home, 'data', 'typemap', 'osmPolyconvert.typ.xml')
         if os.path.exists(typemap):
             self.run_command(["polyconvert", "--osm-files", osm_file, "--type-file", typemap, "-o", poly_file], "Polyconvert")
         else:
             self.log("⚠️ Typemap not found, skipping Polyconvert.")
-
-        # --- Step 4: Random Trips (Unchanged) ---
         self.log("--- Step 4: Generating Random Trips ---")
         random_trips_script = os.path.join(self.sumo_home, 'tools', 'randomTrips.py')
         trip_period = self.end_time / self.num_trips
@@ -509,8 +495,6 @@ sim-time-limit = {end_time}s
             "--validate"
         ]
         if not self.run_command(trips_cmd, "Random Trips"): return False, "", "", None
-
-        # --- Step 5: DUAROUTER (Unchanged) ---
         self.log("--- Step 5: Calculating Routes (DUAROUTER) ---")
         dua_cmd = [
             "duarouter",
@@ -519,8 +503,6 @@ sim-time-limit = {end_time}s
             "-o", route_file
         ]
         if not self.run_command(dua_cmd, "DUAROUTER"): return False, "", "", None
-
-        # --- Step 6: Route Analysis and Plotting (Unchanged) ---
         self.log("--- Step 6: Analyzing Route Usage and Plotting ---")
         
         top_edges_list = self.most_used_route_finder(route_file, top_n=10)
@@ -531,7 +513,6 @@ sim-time-limit = {end_time}s
             self.log("📊 Graphical Report Figure created successfully.")
         else:
             self.log("⚠️ Plotting skipped: No edges found in the route file.")
-        # --- Step 7: Configuration Files (Unchanged) ---
         self.log("--- Step 7: Writing Configuration Files ---")
         launchd_clean = self.generate_launchd(filename , "Clean")
         launched_blocked = self.generate_launchd(filename , "Blocked")
@@ -549,44 +530,23 @@ sim-time-limit = {end_time}s
         except Exception as e:
             self.log(f"❌ Error extracting coordinates: {e}")
             return False, "", "", None
-        PERCENTAGE_INCREASE = 0.50  # 50% larger
-        
-        # Calculate original map dimensions
+        PERCENTAGE_INCREASE = 0.50 
         original_width = max_x - min_x
         original_height = max_y - min_y
-
-        # Calculate the total buffer needed based on the percentage
-        # e.g., if original width is 1000m, buffer_x will be 500m
         BUFFER_SIZE_X = original_width * PERCENTAGE_INCREASE
         BUFFER_SIZE_Y = original_height * PERCENTAGE_INCREASE
-
-        # The amount the RSU must be shifted is half the buffer size
         OFFSET_X = BUFFER_SIZE_X / 2.0  
         OFFSET_Y = BUFFER_SIZE_Y / 2.0  
-        
-        # 1. Calculate the final playground size (Original Size + Total Buffer)
         play_ground_x_final = original_width + BUFFER_SIZE_X
         play_ground_y_final = original_height + BUFFER_SIZE_Y
-        
-        # 2. Calculate the RSU position (Original Relative Center + Offset)
-        # Original relative X: center_x - min_x
         rsu_x_shifted = (original_width / 2.0) + OFFSET_X
-        # Original relative Y: max_y - center_y
         rsu_y_shifted = (original_height / 2.0) + OFFSET_Y
-        
-        # Note: You must update the call to use the dynamically calculated buffers
         clean_ini = self.generate_omnetpp_ini(filename , play_ground_x_final , play_ground_y_final , rsu_x_shifted , rsu_y_shifted , self.end_time , "Clean")
-        
         target_edge = top_edges_list[0][0]
         blocked_ini = self.generate_Blocked_omnetini_File(filename , play_ground_x_final , play_ground_y_final , rsu_x_shifted , rsu_y_shifted , self.end_time , target_edge , "Blocked")
-
-        # --- Step 8: Cleanup (Unchanged) ---
         self.log("--- Step 8: Cleaning up ---")
         self.cleanup(filename)
-
         return True, launchd_clean, launched_blocked , sumocfg_clean, plot_figure , sumocfg_blocked 
-
-    # --- Configuration Generating Functions (Unchanged) ---
     def generate_launchd(self, filename , type : str):
         content = f"""<?xml version="1.0"?>
 <launch>
@@ -775,8 +735,6 @@ sim-time-limit = {end_time}s
                     os.remove(f)
                     self.log(f"Removed temp file: {f}")
                 except: pass
-
-# --- 3. MAIN APPLICATION (Modified Handle Bounds) ---
 class SumoApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -786,68 +744,48 @@ class SumoApp(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
-
-        # Top Controls (Unchanged)
-        controls_layout = QHBoxLayout()
-        
+        controls_layout = QHBoxLayout() 
         self.filename_edit = QLineEdit("VeinsScenario")
         self.time_spin = QSpinBox(); self.time_spin.setRange(100, 100000); self.time_spin.setValue(3600)
         self.trips_spin = QSpinBox(); self.trips_spin.setRange(1, 100000); self.trips_spin.setValue(10000)
-        # --- ADD THIS IN SumoApp.__init__ ---
         self.attack_start_spin = QSpinBox()
         self.attack_start_spin.setRange(0, 100000)
         self.attack_start_spin.setValue(100)
         self.attack_start_spin.setSuffix("s")
-
         self.attack_duration_spin = QSpinBox()
         self.attack_duration_spin.setRange(0, 100000)
         self.attack_duration_spin.setValue(500)
         self.attack_duration_spin.setSuffix("s")
-
-        # Add them to the layout so they appear on screen
         controls_layout.addWidget(QLabel("Attack Start:"))
         controls_layout.addWidget(self.attack_start_spin)
         controls_layout.addWidget(QLabel("Duration:"))
         controls_layout.addWidget(self.attack_duration_spin)
-        
         controls_layout.addWidget(QLabel("Filename:"))
         controls_layout.addWidget(self.filename_edit)
         controls_layout.addWidget(QLabel("Duration (s):"))
         controls_layout.addWidget(self.time_spin)
         controls_layout.addWidget(QLabel("Vehicles:"))
         controls_layout.addWidget(self.trips_spin)
-        
         self.btn_generate = QPushButton("Generate Simulation Files")
         self.btn_generate.setStyleSheet("background-color: #0078D7; color: white; font-weight: bold; padding: 8px;")
         self.btn_generate.clicked.connect(self.start_process)
-        controls_layout.addWidget(self.btn_generate)
-        
+        controls_layout.addWidget(self.btn_generate)   
         layout.addLayout(controls_layout)
-
-        # Tabs
         self.tabs = QTabWidget()
-        
-        # Tab 1: Map (Unchanged)
         self.map_view = QWebEngineView()
         self.map_view.setHtml(MAP_HTML)
         self.tabs.addTab(self.map_view, "1. Select Area")
-        
-        # Tab 2: Logs (Unchanged)
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: monospace;")
         self.tabs.addTab(self.log_view, "2. Process Log")
-        
-        # Tab 3: Plot (NEW)
         self.plot_viewer = PlotViewer()
         self.tabs.addTab(self.plot_viewer, "3. Route Analysis Plot")
         
         layout.addWidget(self.tabs)
 
     def start_process(self):
-        # 1. Get bounds from JS
         self.map_view.page().runJavaScript("getSelectionBounds()", self.handle_bounds)
-
     def handle_bounds(self, bounds):
         """
         Handles the bounds data and initiates the worker thread.
@@ -856,27 +794,17 @@ class SumoApp(QMainWindow):
         filename = self.filename_edit.text().strip()
         osm_file = f"{filename}.osm"
         is_valid_file = False
-        
-        # Check if a valid file exists
         if os.path.exists(osm_file):
             if os.path.getsize(osm_file) > MIN_OSM_FILE_SIZE:
                 is_valid_file = True
-
-        # --- CORE NEW LOGIC ---
         if not bounds:
             if is_valid_file:
-                # Case 1: No selection, but a valid file exists -> Proceed using dummy bounds
                 QMessageBox.information(self, "Using Existing File", f"No area selected. Proceeding with analysis and generation using existing file: {osm_file}")
-                # Set dummy bounds, the worker will check 'should_download' internally
                 bounds = {'west': 0, 'south': 0, 'east': 0, 'north': 0} 
             else:
-                # Case 2: No selection and no valid file exists -> Stop and prompt user
                 QMessageBox.warning(self, "Action Required", "Please draw a rectangle on the map to define the simulation area, or ensure a valid OSM file exists.")
-                self.tabs.setCurrentIndex(0) # Return to the map tab
+                self.tabs.setCurrentIndex(0)
                 return
-        # --- END CORE NEW LOGIC ---
-        
-        # If bounds exist, or if we are in Case 1, we proceed here.
         config = {
             'filename': filename,
             'bbox': bounds,
@@ -885,13 +813,9 @@ class SumoApp(QMainWindow):
             'attack_start': self.attack_start_spin.value(),    
             'attack_duration': self.attack_duration_spin.value()
         }
-
-        # Switch to Log Tab
         self.tabs.setCurrentIndex(1)
         self.log_view.clear()
         self.btn_generate.setEnabled(False)
-
-        # Start Worker
         self.worker = SumoWorker(config)
         self.worker.log_signal.connect(self.update_log)
         self.worker.finished_signal.connect(self.process_finished) 
